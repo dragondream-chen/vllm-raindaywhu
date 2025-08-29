@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE, FusedMoEActivationFormat, FusedMoEConfig, FusedMoEMethodBase,
     FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize,
     FusedMoeWeightScaleSupported)
+from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEModularKernel
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -930,6 +931,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert logical_to_physical_map is not None
             assert logical_replica_count is not None
             assert isinstance(layer, FusedMoE)
+            # 如果在负载均衡中优化热力图更新的性能，直接通过fused_experts内部进行更新，跳过通过FusedMoE.select_experts的topk更新
+            if not (hasattr(layer, 'fused_experts') and 
+                   isinstance(layer.fused_experts, FusedMoEModularKernel)):
+                skip_expert_load_scatter_add = True
+
         if not self.flashinfer_moe_enabled:
             topk_weights, topk_ids = FusedMoE.select_experts(
                 hidden_states=x,
@@ -948,6 +954,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 expert_load_view=expert_load_view,
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
+                skip_expert_load_scatter_add=skip_expert_load_scatter_add
             )
 
         if self.rocm_aiter_moe_enabled:
@@ -1044,6 +1051,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                           if self.block_quant else layer.w2_weight_scale),
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                expert_load_view=expert_load_view,
             )
         else:
             from vllm.model_executor.layers.fused_moe import fused_experts

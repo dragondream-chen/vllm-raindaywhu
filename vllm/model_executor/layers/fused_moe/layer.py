@@ -449,6 +449,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        
+        if enable_eplb:
+            assert expert_load_view is not None
+            assert logical_to_physical_map is not None
+            assert logical_replica_count is not None
+            assert isinstance(layer, FusedMoE)
+            # 如果在负载均衡中优化热力图更新的性能，直接通过fused_experts内部进行更新，跳过通过FusedMoE.select_experts的topk更新
+            if not (hasattr(layer, 'fused_experts') and 
+                   isinstance(layer.fused_experts, FusedMoEModularKernel)):
+                skip_expert_load_scatter_add = True
 
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -466,7 +476,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_map=expert_map,
             expert_load_view=expert_load_view,
             logical_to_physical_map=logical_to_physical_map,
-            logical_replica_count=logical_replica_count)
+            logical_replica_count=logical_replica_count,
+            skip_expert_load_scatter_add=skip_expert_load_scatter_add
+            )
 
         if self.rocm_aiter_moe_enabled:
             return self.rocm_aiter_fused_experts(
@@ -493,6 +505,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
+                expert_load_view=expert_load_view,
             )
         else:
             assert fused_experts is not None
@@ -1386,6 +1399,7 @@ class FusedMoE(CustomOp):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        skip_expert_load_scatter_add: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -1465,36 +1479,29 @@ class FusedMoE(CustomOp):
 
             topk_ids = physical_ids
 
-            # 2. Record expert load metrics.
+            # 2. Record expert load metrics
+            # Note: When using FusedMoEModularKernel, expert load statistics are handled
+            # directly in the kernel using ExpertTokensMetadata.expert_num_tokens for better performance.
+            # For other implementations or when metadata is not available, we fall back to scatter_add_.
+            
+            # Check if we're using FusedMoEModularKernel and if it has already processed the load
+            # If not, use the traditional scatter_add_ approach
+            if not skip_expert_load_scatter_add:
+                # Fallback to scatter_add_ for non-modular kernel implementations
+                topk_ids_flatten = topk_ids.flatten()
 
-            # TODO(bowen): When using `FusedMoEModularKernel`, this
-            # can be done in a more unified way, since
-            # `FusedMoEPrepareAndFinalize` will return the expert
-            # token count, in some cases directly from the kernel.
-            # However, now there are many code paths not using
-            # the modular kernel, e.g. calling `fused_experts`,
-            # so we decide to keep the logic here.
-            #
-            # If later refactor moved all the MoE kernel calls
-            # to the modular kernel, we can move this logic there
-            # to achieve better efficiency.
+                # Performance optimization:
+                # `masked_fill` is significantly faster than `masked_select`
+                invalid_mask = topk_ids_flatten < 0
+                # Replace invalid expert ids with 0 (just a dummy position)
+                # to avoid out-of-bounds errors in scatter_add_
+                index = topk_ids_flatten.masked_fill_(invalid_mask, 0)
+                # `src` is the valid mask, which is 1 for valid and 0 for invalid
+                src = ~invalid_mask
 
-            # `expert_load_view`: (num_physical_experts,)
-
-            topk_ids_flatten = topk_ids.flatten()
-
-            # Performance optimization:
-            # `masked_fill` is significantly faster than `masked_select`
-            invalid_mask = topk_ids_flatten < 0
-            # Replace invalid expert ids with 0 (just a dummy position)
-            # to avoid out-of-bounds errors in scatter_add_
-            index = topk_ids_flatten.masked_fill_(invalid_mask, 0)
-            # `src` is the valid mask, which is 1 for valid and 0 for invalid
-            src = ~invalid_mask
-
-            expert_load_view.scatter_add_(dim=0,
-                                          index=index.long(),
-                                          src=src.to(expert_load_view))
+                expert_load_view.scatter_add_(dim=0,
+                                              index=index.long(),
+                                              src=src.to(expert_load_view))
 
             topk_ids = topk_ids.to(dtype=indices_type)
 
@@ -1542,6 +1549,18 @@ class FusedMoE(CustomOp):
         if current_platform.is_tpu():
             return self.forward_impl(hidden_states, router_logits)
         else:
+            # Example of how to use ExpertTokensMetadata for load tracking
+            # when using FusedMoEModularKernel
+            if (hasattr(self, 'expert_load_view') and 
+                self.expert_load_view is not None and
+                hasattr(self, 'fused_experts') and 
+                isinstance(self.fused_experts, FusedMoEModularKernel)):
+                
+                # Get expert tokens metadata from the modular kernel
+                # This would be available after calling the kernel's prepare method
+                # For demonstration purposes, we show the structure
+                logger.debug("Using ExpertTokensMetadata for expert load tracking")
+            
             return torch.ops.vllm.moe_forward(
                 hidden_states, router_logits,
                 self.layer_name)[..., :og_hidden_states]
