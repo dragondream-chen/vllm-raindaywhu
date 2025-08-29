@@ -932,8 +932,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert logical_replica_count is not None
             assert isinstance(layer, FusedMoE)
             # 如果在负载均衡中优化热力图更新的性能，直接通过fused_experts内部进行更新，跳过通过FusedMoE.select_experts的topk更新
-            if not (hasattr(layer, 'fused_experts') and 
-                   isinstance(layer.fused_experts, FusedMoEModularKernel)):
+            if (hasattr(layer, 'fused_experts') and 
+                isinstance(layer.fused_experts, FusedMoEModularKernel)):
                 skip_expert_load_scatter_add = True
 
         if not self.flashinfer_moe_enabled:
